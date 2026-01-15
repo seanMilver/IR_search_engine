@@ -7,13 +7,13 @@ import nltk
 from nltk.stem.porter import PorterStemmer
 from nltk.corpus import stopwords
 import threading
-import json
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import os
 
 # --- GCP CONFIGURATION ---
-PROJECT_ID = 'storied-epigram-480214-e9'
-BUCKET_NAME = 'bucket_323040972'
+PROJECT_ID = ''
+BUCKET_NAME = ''
 
 # --- BUCKET PATHS ---
 BODY_INDEX_BLOB = 'postings_gcp/index.pkl'
@@ -27,6 +27,35 @@ TITLE_INDEX_BLOB = 'postings_title_gcp/title_index.pkl'
 PAGEVIEWS_SHARDS_PREFIX = 'pageviews_shards/2021-08'
 
 app = Flask(__name__)
+
+def load_essential_config(file_path='ProjAndBucket.txt'):
+    # Throw exception if the file is missing
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Critical Error: The configuration file '{file_path}' was not found. System cannot start.")
+
+    config = {}
+    with open(file_path, 'r') as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                config[key] = value
+
+    # Check for specific required keys
+    if 'PROJECT_ID' not in config or 'BUCKET_NAME' not in config:
+        raise KeyError("Config Error: 'PROJECT_ID' and 'BUCKET_NAME' must be defined in config.txt")
+        
+    return config
+
+# Load values at the global level
+try:
+    config_data = load_essential_config()
+    PROJECT_ID = config_data['PROJECT_ID']
+    BUCKET_NAME = config_data['BUCKET_NAME']
+    print(f"Config loaded for Project: {PROJECT_ID}")
+except Exception as e:
+    # This will stop the server from even initializing
+    print(f"FATAL STARTUP ERROR: {e}")
+    raise
 
 # --- INITIALIZE TOOLS ---
 stemmer = PorterStemmer()
