@@ -284,6 +284,20 @@ def get_pagerank_values(ids):
 
 @app.route("/get_pagerank", methods=['POST'])
 def get_pagerank():
+    ''' Returns PageRank values for a list of provided wiki article IDs. 
+
+        Test this by issuing a POST request to a URL like:
+          http://YOUR_SERVER_DOMAIN/get_pagerank
+        with a json payload of the list of article ids. In python do:
+          import requests
+          requests.post('http://YOUR_SERVER_DOMAIN/get_pagerank', json=[1,5,8])
+        As before YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
+        if you're using ngrok on Colab or your external IP on GCP.
+    Returns:
+    --------
+        list of floats:
+          list of PageRank scores that correrspond to the provided article IDs.
+    '''
     ids = request.get_json()
     if not ids: return jsonify([])
     # Called only when needed
@@ -317,55 +331,178 @@ def get_pageview_values(ids):
     
 @app.route("/get_pageview", methods=['POST'])
 def get_pageview():
+    ''' Returns the number of page views that each of the provide wiki articles
+        had in August 2021.
+
+        Test this by issuing a POST request to a URL like:
+          http://YOUR_SERVER_DOMAIN/get_pageview
+        with a json payload of the list of article ids. In python do:
+          import requests
+          requests.post('http://YOUR_SERVER_DOMAIN/get_pageview', json=[1,5,8])
+        As before YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
+        if you're using ngrok on Colab or your external IP on GCP.
+    Returns:
+    --------
+        list of ints:
+          list of page view numbers from August 2021 that correrspond to the 
+          provided list article IDs.
+    '''
     ids = request.get_json(silent=True) or []
     return jsonify(get_pageview_values(ids))
 
+
+# --- STAFF PROVIDED CONFIG ---
+corpus_stopwords = ["category", "references", "also", "external", "links", 
+                    "may", "first", "see", "history", "people", "one", "two", 
+                    "part", "thumb", "including", "second", "following", 
+                    "many", "however", "would", "became"]
+
+all_stopwords = english_stopwords.union(corpus_stopwords)
+RE_WORD_STAFF = re.compile(r"[\#\@\w](['\-]?\w){2,24}", re.UNICODE)
+
+# Updated tokenize function to use all_stopwords
+def tokenize_staff(text, stem=False):
+    # Staff provided logic: extract tokens using RE_WORD
+    tokens = [t.group() for t in RE_WORD_STAFF.finditer(text.lower())]
+    # Filter out all_stopwords (English + Corpus)
+    filtered = [t for t in tokens if t not in all_stopwords]
+    return [stemmer.stem(t) for t in filtered] if stem else filtered
+
+
 @app.route("/search_body")
 def search_body():
+    ''' Returns up to a 100 search results for the query using TFIDF AND COSINE
+        SIMILARITY OF THE BODY OF ARTICLES ONLY. DO NOT use stemming. DO USE the 
+        staff-provided tokenizer from Assignment 3 (GCP part) to do the 
+        tokenization and remove stopwords. 
+
+        To issue a query navigate to a URL like:
+         http://YOUR_SERVER_DOMAIN/search_body?query=hello+world
+        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
+        if you're using ngrok on Colab or your external IP on GCP.
+    Returns:
+    --------
+        list of up to 100 search results, ordered from best to worst where each 
+        element is a tuple (wiki_id, title).
+    '''
     query = request.args.get('query', '')
     if not query: return jsonify([])
+    
     try:
         index = get_body_index()
-        tokens = tokenize(query, stem=False)
+        # Requirement: No stemming
+        tokens = tokenize_staff(query, stem=False) 
+        if not tokens: return jsonify([])
+        
         scores = Counter()
-        for token in tokens:
-            if token in index.posting_locs:
-                idf = math.log10(6348910 / index.df.get(token, 1))
-                for doc_id, tf in get_posting_list(index, token, BODY_POSTINGS_PREFIX)[1]:
-                    scores[doc_id] += (tf * idf)
-        top30 = scores.most_common(30)
-        return jsonify([(str(doc_id), get_real_title(doc_id)) for doc_id, _ in top30])
-    except: return jsonify([])
+        # Parallel Retrieval mirroring the main search style
+        with ThreadPoolExecutor(max_workers=len(tokens)) as executor:
+            futures = [executor.submit(get_posting_list, index, t, BODY_POSTINGS_PREFIX) for t in tokens]
+            for future in futures:
+                token, postings = future.result()
+                df = index.df.get(token, 0)
+                if df > 0:
+                    # Log-based IDF as per common TF-IDF practices
+                    idf = math.log10(N_DOCS / df) 
+                    for doc_id, tf in postings:
+                        scores[int(doc_id)] += (tf * idf)
+        
+        # Sort best to worst, return top 100
+        top_results = scores.most_common(100)
+        return jsonify([(str(d_id), get_real_title(d_id)) for d_id, _ in top_results])
+        
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route("/search_title")
 def search_title():
+    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
+        IN THE TITLE of articles, ordered in descending order of the NUMBER OF 
+        DISTINCT QUERY WORDS that appear in the title. DO NOT use stemming. DO 
+        USE the staff-provided tokenizer from Assignment 3 (GCP part) to do the 
+        tokenization and remove stopwords. For example, a document 
+        with a title that matches two distinct query words will be ranked before a 
+        document with a title that matches only one distinct query word, 
+        regardless of the number of times the term appeared in the title (or 
+        query). 
+
+        Test this by navigating to the a URL like:
+         http://YOUR_SERVER_DOMAIN/search_title?query=hello+world
+        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
+        if you're using ngrok on Colab or your external IP on GCP.
+    Returns:
+    --------
+        list of ALL (not just top 100) search results, ordered from best to 
+        worst where each element is a tuple (wiki_id, title).
+    '''
     query = request.args.get('query', '')
     if not query: return jsonify([])
+    
     try:
         tindex = get_title_index()
+        # Use set to ensure we are counting DISTINCT words
+        tokens = list(set(tokenize_staff(query, stem=False))) 
+        if not tokens: return jsonify([])
+        
         counts = Counter()
-        tokens = set(tokenize(query, stem=False))
-        for token in tokens:
-            for doc_id, _ in get_posting_list(tindex, token, TITLE_POSTINGS_PREFIX)[1]:
-                counts[doc_id] += 1
-        top30 = counts.most_common(30)
-        return jsonify([(str(doc_id), get_real_title(doc_id)) for doc_id, _ in top30])
-    except: return jsonify([])
+        with ThreadPoolExecutor(max_workers=len(tokens)) as executor:
+            futures = [executor.submit(get_posting_list, tindex, t, TITLE_POSTINGS_PREFIX) for t in tokens]
+            for future in futures:
+                _, postings = future.result()
+                for doc_id, _ in postings:
+                    # Count distinct query word occurrences
+                    counts[int(doc_id)] += 1
+        
+        # Return ALL results sorted by distinct word matches (descending)
+        sorted_res = sorted(counts.items(), key=itemgetter(1), reverse=True)
+        return jsonify([(str(d_id), get_real_title(d_id)) for d_id, _ in sorted_res])
+        
+    except Exception as e:
+        return jsonify([])
 
 @app.route("/search_anchor")
 def search_anchor():
+    ''' Returns ALL (not just top 100) search results that contain A QUERY WORD 
+        IN THE ANCHOR TEXT of articles, ordered in descending order of the 
+        NUMBER OF QUERY WORDS that appear in anchor text linking to the page. 
+        DO NOT use stemming. DO USE the staff-provided tokenizer from Assignment 
+        3 (GCP part) to do the tokenization and remove stopwords. For example, 
+        a document with a anchor text that matches two distinct query words will 
+        be ranked before a document with anchor text that matches only one 
+        distinct query word, regardless of the number of times the term appeared 
+        in the anchor text (or query). 
+
+        Test this by navigating to the a URL like:
+         http://YOUR_SERVER_DOMAIN/search_anchor?query=hello+world
+        where YOUR_SERVER_DOMAIN is something like XXXX-XX-XX-XX-XX.ngrok.io
+        if you're using ngrok on Colab or your external IP on GCP.
+    Returns:
+    --------
+        list of ALL (not just top 100) search results, ordered from best to 
+        worst where each element is a tuple (wiki_id, title).
+    '''
     query = request.args.get('query', '')
     if not query: return jsonify([])
+    
     try:
         aindex = get_anchor_index()
+        tokens = list(set(tokenize_staff(query, stem=False)))
+        if not tokens: return jsonify([])
+        
         counts = Counter()
-        tokens = set(tokenize(query, stem=False))
-        for token in tokens:
-            for doc_id, _ in get_posting_list(aindex, token, ANCHOR_POSTINGS_PREFIX)[1]:
-                counts[doc_id] += 1
-        top30 = counts.most_common(30)
-        return jsonify([(str(doc_id), get_real_title(doc_id)) for doc_id, _ in top30])
-    except: return jsonify([])
+        with ThreadPoolExecutor(max_workers=len(tokens)) as executor:
+            futures = [executor.submit(get_posting_list, aindex, t, ANCHOR_POSTINGS_PREFIX) for t in tokens]
+            for future in futures:
+                _, postings = future.result()
+                for doc_id, _ in postings:
+                    counts[int(doc_id)] += 1
+        
+        # Return ALL results sorted by distinct word matches (descending)
+        sorted_res = sorted(counts.items(), key=itemgetter(1), reverse=True)
+        return jsonify([(str(d_id), get_real_title(d_id)) for d_id, _ in sorted_res])
+        
+    except Exception as e:
+        return jsonify([])
 
 def run(**kwargs):
     """Allows se.run() call from your launcher code."""
